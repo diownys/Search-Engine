@@ -2,59 +2,59 @@ import streamlit as st
 import pandas as pd
 import requests
 
-st.set_page_config(page_title="PharmUp Search", page_icon="💊", layout="wide")
+st.set_page_config(page_title="Monitor PharmUp", page_icon="💊", layout="wide")
 
-# --- 1. CARREGAMENTO DOS DADOS ---
+# --- 1. CARREGAMENTO DOS DADOS (GOOGLE SHEETS) ---
 @st.cache_data(ttl=60)
 def load_data():
     try:
         url_lotes = st.secrets["url_lotes"]
         url_produtos = st.secrets["url_produtos"]
-    except Exception:
-        st.error("⚠️ Secrets não configurados!")
+    except:
+        st.error("❌ ERRO CRÍTICO: Secrets não configurados.")
         return pd.DataFrame(), pd.DataFrame()
 
     df_lotes = pd.DataFrame()
     df_produtos = pd.DataFrame()
 
-    # Carrega Lotes
+    # Tabela 1: Lotes
     try:
         df_lotes = pd.read_csv(url_lotes)
         if len(df_lotes.columns) >= 2:
-            df_lotes = df_lotes.rename(columns={df_lotes.columns[0]: 'lote_ref', df_lotes.columns[1]: 'endereco_ref'})
+            # Pega 1ª e 2ª coluna independente do nome
+            df_lotes = df_lotes.iloc[:, :2] 
+            df_lotes.columns = ['lote_ref', 'endereco_ref']
             df_lotes['lote_ref'] = df_lotes['lote_ref'].astype(str).str.strip().str.upper()
-            df_lotes['endereco_ref'] = df_lotes['endereco_ref'].astype(str).str.strip()
     except Exception as e:
-        st.error(f"Erro Lotes: {e}")
+        st.warning(f"⚠️ Aviso na Tabela Lotes: {e}")
 
-    # Carrega Produtos
+    # Tabela 2: Produtos
     try:
         df_produtos = pd.read_csv(url_produtos)
         if len(df_produtos.columns) >= 2:
-            df_produtos = df_produtos.rename(columns={df_produtos.columns[0]: 'produto_ref', df_produtos.columns[1]: 'endereco_ref'})
+            # Pega 1ª e 2ª coluna independente do nome ("Produtos", "Descricao", etc)
+            df_produtos = df_produtos.iloc[:, :2]
+            df_produtos.columns = ['produto_ref', 'endereco_ref']
             df_produtos['produto_ref'] = df_produtos['produto_ref'].astype(str).str.strip().str.upper()
-            df_produtos['endereco_ref'] = df_produtos['endereco_ref'].astype(str).str.strip()
     except Exception as e:
-        st.error(f"Erro Produtos: {e}")
+        st.warning(f"⚠️ Aviso na Tabela Produtos: {e}")
 
     return df_lotes, df_produtos
 
-# --- 2. INTEGRAÇÃO COM DIAGNÓSTICO ---
+# --- 2. CONEXÃO COM PHARMUP ---
 def search_pharmup_api(search_term):
-    # Debug: Mostra o que foi lido dos secrets
+    # Carrega configurações
     try:
         config = st.secrets["pharmup"]
-        # Garante que os valores são strings limpas
-        api_url = config["url"].strip().strip('"') 
+        api_url = config["url"].strip('"') # Remove aspas extras se houver
         headers = {
-            "User-Agent": config["user_agent"].strip().strip('"'),
-            "Referer": config["referer"].strip().strip('"'),
-            "Origin": config["origin"].strip().strip('"'),
-            "Host": config["host"].strip().strip('"')
+            "User-Agent": config["user_agent"].strip('"'),
+            "Referer": config["referer"].strip('"'),
+            "Origin": config["origin"].strip('"'),
+            "Host": config["host"].strip('"')
         }
-    except Exception as e:
-        st.error(f"Erro ao ler Secrets PharmUp: {e}")
-        return [], 0, "Erro Config"
+    except:
+        return [], 0, "Erro: Verifique o arquivo secrets.toml (seção [pharmup])"
 
     params = {
         "filterKey": search_term,
@@ -65,8 +65,7 @@ def search_pharmup_api(search_term):
     }
 
     try:
-        response = requests.get(api_url, params=params, headers=headers, timeout=15)
-        # Retorna: Lista, Status Code, Texto Puro da resposta
+        response = requests.get(api_url, params=params, headers=headers, timeout=10)
         try:
             data = response.json().get('list', [])
         except:
@@ -75,56 +74,85 @@ def search_pharmup_api(search_term):
     except Exception as e:
         return [], 0, str(e)
 
-# --- 3. FRONTEND ---
+# --- 3. TELA PRINCIPAL ---
 def main():
-    st.title("💊 PharmUp Search + Debug")
+    st.title("💊 Localizador PharmUp (Modo Diagnóstico)")
     
+    # Status das Tabelas
     df_lotes, df_produtos = load_data()
-    
-    search_query = st.text_input("Pesquisa", placeholder="Ex: CICLOSPORINA")
+    c1, c2 = st.columns(2)
+    if not df_lotes.empty:
+        c1.success(f"✅ Tabela Lotes: {len(df_lotes)} linhas")
+    else:
+        c1.error("❌ Tabela Lotes Vazia")
+        
+    if not df_produtos.empty:
+        c2.success(f"✅ Tabela Produtos: {len(df_produtos)} linhas")
+    else:
+        c2.error("❌ Tabela Produtos Vazia")
 
-    if st.button("Pesquisar") or search_query:
-        # Chama API com Debug
-        api_data, status_code, raw_response = search_pharmup_api(search_query)
+    # Busca
+    search_query = st.text_input("Pesquisar Produto ou Lote", placeholder="Ex: CICLOSPORINA")
 
-        # --- ÁREA DE DIAGNÓSTICO (Importante) ---
-        with st.expander("🛠️ Ver Diagnóstico da Conexão (Clique aqui se der erro)", expanded=True):
-            c1, c2 = st.columns(2)
-            c1.metric("Status Code (Esperado: 200)", status_code)
-            c1.write(f"**Termo Buscado:** {search_query}")
+    if st.button("Buscar") or search_query:
+        st.divider()
+        with st.spinner("Conectando ao PharmUp..."):
+            api_data, status, raw_text = search_pharmup_api(search_query)
+
+        # --- DIAGNÓSTICO DO ERRO ---
+        if not api_data:
+            st.error("🚫 Nenhum resultado retornado pela API.")
             
-            if status_code != 200:
-                c2.error("Erro na comunicação com o servidor!")
-                c2.code(raw_response[:500]) # Mostra o erro real
-            elif not api_data:
-                c2.warning("Servidor respondeu OK (200), mas a lista veio vazia.")
-                c2.code(raw_response[:500]) # Mostra o JSON vazio
-            else:
-                c2.success("Comunicação Perfeita!")
-
-        # --- RESULTADOS ---
-        if api_data:
-            st.write(f"### Resultados ({len(api_data)})")
+            with st.expander("🕵️‍♂️ CLIQUE AQUI PARA VER O MOTIVO", expanded=True):
+                st.write(f"**Status Code:** {status}")
+                
+                if status == 200:
+                    st.warning("O site respondeu OK, mas não achou o produto. Tente pesquisar 'CICLOSPORINA' (igual ao log que você mandou).")
+                    st.code(raw_text) # Mostra o JSON vazio
+                elif status == 403 or status == 500:
+                    st.error("BLOQUEIO: O PharmUp recusou a conexão. Verifique os Secrets.")
+                elif status == 0:
+                    st.error(f"ERRO DE CÓDIGO: {raw_text}")
+        
+        # --- SUCESSO ---
+        else:
+            st.success(f"Encontrados {len(api_data)} itens!")
+            
             for item in api_data:
-                nome = item.get('produtoDescricao', 'Sem Nome')
-                lote = item.get('descricao', 'Sem Lote')
+                # Dados da API
+                nome = str(item.get('produtoDescricao', 'Unknown')).strip()
+                lote = str(item.get('descricao', 'Unknown')).strip()
                 saldo = item.get('quantidadeAtual', 0)
                 
-                # Cruzamento Simples para teste
+                # Cruzamento
                 locais = []
-                if not df_lotes.empty:
-                    match = df_lotes[df_lotes['lote_ref'] == lote.strip().upper()]
-                    if not match.empty:
-                        locais.extend(match['endereco_ref'].unique())
-                
-                endereco_txt = ", ".join(map(str, locais)) if locais else "Não Localizado"
-                cor = "green" if locais else "red"
+                origem = "N/A"
+                cor = "gray"
 
+                # 1. Tenta Lote
+                if not df_lotes.empty:
+                    match = df_lotes[df_lotes['lote_ref'] == lote.upper()]
+                    if not match.empty:
+                        locais = match['endereco_ref'].unique()
+                        origem = "Lote (Exato)"
+                        cor = "green"
+
+                # 2. Tenta Produto
+                if not locais and not df_produtos.empty:
+                    match = df_produtos[df_produtos['produto_ref'].str.contains(nome.upper(), na=False)]
+                    if not match.empty:
+                        locais = match['endereco_ref'].unique()
+                        origem = "Nome (Aproximado)"
+                        cor = "orange"
+
+                end_str = ", ".join(map(str, locais)) if len(locais) > 0 else "Não Localizado"
+                
+                # Card Visual
                 st.markdown(f"""
-                <div style="padding:10px; border:1px solid #ddd; border-radius:5px; margin-bottom:10px;">
-                    <b>{nome}</b> <br>
-                    Lote: <code>{lote}</code> | Saldo: {saldo} <br>
-                    Local: <span style='color:{cor}; font-weight:bold'>{endereco_txt}</span>
+                <div style="border:1px solid #ddd; padding:10px; border-radius:8px; border-left: 5px solid {cor}; margin-bottom:10px">
+                    <h4 style="margin:0">{nome}</h4>
+                    <p style="margin:0">Lote: <b>{lote}</b> | Saldo: <b>{saldo}</b></p>
+                    <p style="margin:0; font-size:1.1em">📍 <b>{end_str}</b> <span style="font-size:0.8em; color:#666">({origem})</span></p>
                 </div>
                 """, unsafe_allow_html=True)
 
