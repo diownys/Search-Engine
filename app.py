@@ -9,38 +9,75 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. CARREGAMENTO DOS DADOS (LINKS PÚBLICOS) ---
-@st.cache_data(ttl=60) # Atualiza a cada 60 segundos
+# --- 1. CARREGAMENTO DOS DADOS (BLINDADO) ---
+@st.cache_data(ttl=60)
 def load_data():
     """
-    Lê os dados diretamente dos links CSV publicados no Google Sheets.
+    Lê os dados e renomeia as colunas pela posição, ignorando os nomes originais.
     """
-    # URLs fornecidas por você
-    url_lotes = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQxoAwleQXfsqfCDNKjarxYFqMhO0qujcIGZMhBZHv4b_CkL7JwucqR3AbqRgHpseVCjQPCI-ywCFXj/pub?gid=0&single=true&output=csv"
-    
-    # Atenção: Verifique se este segundo link traz realmente a aba de produtos.
-    # Geralmente links diferentes tem 'gid' diferentes.
-    url_produtos = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQxoAwleQXfsqfCDNKjarxYFqMhO0qujcIGZMhBZHv4b_CkL7JwucqR3AbqRgHpseVCjQPCI-ywCFXj/pub?output=csv"
-
+    # Recupera links dos Secrets
     try:
-        # Carrega Lotes
-        df_lotes = pd.read_csv(url_lotes)
-        # Padroniza colunas para evitar erros de leitura
-        df_lotes['lote_completo'] = df_lotes['lote_completo'].astype(str).str.strip().str.upper()
-        
-        # Carrega Produtos
-        df_produtos = pd.read_csv(url_produtos)
-        df_produtos['produto'] = df_produtos['produto'].astype(str).str.strip().str.upper()
-
-        return df_lotes, df_produtos
-
-    except Exception as e:
-        st.error(f"Erro ao ler as planilhas: {e}")
+        url_lotes = st.secrets["url_lotes"]
+        url_produtos = st.secrets["url_produtos"]
+    except Exception:
+        # Fallback para teste local caso não tenha secrets
+        st.error("Configure os Secrets (url_lotes e url_produtos)!")
         return pd.DataFrame(), pd.DataFrame()
+
+    df_lotes = pd.DataFrame()
+    df_produtos = pd.DataFrame()
+
+    # --- CARREGA LOTES ---
+    try:
+        df_lotes = pd.read_csv(url_lotes)
+        # SE A TABELA TIVER DADOS, RENOMEAMOS AS COLUNAS PELA POSIÇÃO
+        if len(df_lotes.columns) >= 2:
+            # Pega o nome real da 1ª e 2ª coluna
+            col_lote_real = df_lotes.columns[0]
+            col_end_real = df_lotes.columns[1]
+            
+            # Renomeia para um padrão interno nosso
+            df_lotes = df_lotes.rename(columns={col_lote_real: 'lote_ref', col_end_real: 'endereco_ref'})
+            
+            # Limpeza
+            df_lotes['lote_ref'] = df_lotes['lote_ref'].astype(str).str.strip().str.upper()
+            df_lotes['endereco_ref'] = df_lotes['endereco_ref'].astype(str).str.strip()
+    except Exception as e:
+        st.error(f"Erro ao ler Lotes: {e}")
+
+    # --- CARREGA PRODUTOS ---
+    try:
+        df_produtos = pd.read_csv(url_produtos)
+        if len(df_produtos.columns) >= 2:
+            # Pega o nome real da 1ª e 2ª coluna
+            col_prod_real = df_produtos.columns[0] # Ex: "Produtos"
+            col_end_real = df_produtos.columns[1]  # Ex: "Endereço"
+            
+            # Renomeia
+            df_produtos = df_produtos.rename(columns={col_prod_real: 'produto_ref', col_end_real: 'endereco_ref'})
+            
+            # Limpeza
+            df_produtos['produto_ref'] = df_produtos['produto_ref'].astype(str).str.strip().str.upper()
+            df_produtos['endereco_ref'] = df_produtos['endereco_ref'].astype(str).str.strip()
+    except Exception as e:
+        st.error(f"Erro ao ler Produtos: {e}")
+
+    return df_lotes, df_produtos
 
 # --- 2. INTEGRAÇÃO COM A API PHARMUP ---
 def search_pharmup_api(search_term):
-    url = "https://pharmup-industria-api.azurewebsites.net/ProdutoLote/ListProdutoLote"
+    try:
+        config = st.secrets["pharmup"]
+        api_url = config["url"]
+        headers = {
+            "User-Agent": config["user_agent"],
+            "Referer": config["referer"],
+            "Origin": config["origin"],
+            "Host": config["host"]
+        }
+    except Exception:
+        st.error("Erro nos Secrets do PharmUp.")
+        return []
     
     params = {
         "filterKey": search_term,
@@ -50,62 +87,54 @@ def search_pharmup_api(search_term):
         "pageSize": 50
     }
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://pharmup-industria.azurewebsites.net/",
-        "Origin": "https://pharmup-industria.azurewebsites.net",
-        "Host": "pharmup-industria-api.azurewebsites.net"
-    }
-
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response = requests.get(api_url, params=params, headers=headers, timeout=10)
         if response.status_code == 200:
             return response.json().get('list', [])
-        else:
-            return []
-    except Exception as e:
-        st.error(f"Erro de conexão com PharmUp: {e}")
+        return []
+    except Exception:
         return []
 
-# --- 3. LÓGICA DE CRUZAMENTO ---
+# --- 3. LÓGICA DE CRUZAMENTO (ATUALIZADA) ---
 def process_results(api_results, df_lotes, df_produtos):
     processed_data = []
 
     for item in api_results:
+        # Dados da API PharmUp
         lote_api = str(item.get('descricao', '')).strip()
         nome_produto = str(item.get('produtoDescricao', '')).strip()
         saldo = item.get('quantidadeAtual', 0)
         unidade = item.get('unidadeMedidaSigla', '')
-        validade = item.get('dataValidade', '')[:10]
+        
+        raw_date = item.get('dataValidade', '')
+        validade = raw_date[:10] if raw_date else ""
 
         endereco = "NÃO LOCALIZADO"
-        origem_endereco = "N/A"
+        origem_endereco = "---"
         cor_destaque = "red"
 
-        # 1. Busca LOTE (Tabela 1)
-        match_lote = df_lotes[df_lotes['lote_completo'] == lote_api.upper()]
-        
-        if not match_lote.empty:
-            if 'cod_endereco' in match_lote.columns:
-                locais = match_lote['cod_endereco'].unique()
+        # 1. TENTA BUSCAR PELO LOTE (Tabela 1 - Fracionamento)
+        # Verifica se df_lotes tem dados e colunas corretas
+        if not df_lotes.empty and 'lote_ref' in df_lotes.columns:
+            match_lote = df_lotes[df_lotes['lote_ref'] == lote_api.upper()]
+            
+            if not match_lote.empty:
+                locais = match_lote['endereco_ref'].unique()
                 endereco = ", ".join(map(str, locais))
-                origem_endereco = "🎯 Lote Exato (Sistema)"
+                origem_endereco = "🎯 Lote (Fracionamento)"
                 cor_destaque = "green"
         
-        # 2. Busca DESCRIÇÃO (Tabela 2)
-        else:
-            # Verifica se tem dados na tabela de produtos
-            if not df_produtos.empty and 'produto' in df_produtos.columns:
-                match_desc = df_produtos[df_produtos['produto'].str.contains(nome_produto.upper(), regex=False, na=False)]
-                if not match_desc.empty:
-                    # Tenta achar a coluna de endereço (pode ser 'Endereço', 'Local', etc)
-                    cols = [c for c in df_produtos.columns if 'endere' in c.lower() or 'local' in c.lower()]
-                    col_alvo = cols[0] if cols else df_produtos.columns[1]
-                    
-                    locais = match_desc[col_alvo].unique()
-                    endereco = ", ".join(map(str, locais))
-                    origem_endereco = "⚠️ Aproximado (Planilha)"
-                    cor_destaque = "orange"
+        # 2. SE FALHAR, TENTA PELA DESCRIÇÃO (Tabela 2 - Spex)
+        # Só entra aqui se não achou pelo lote
+        if cor_destaque == "red" and not df_produtos.empty and 'produto_ref' in df_produtos.columns:
+            # Busca parcial (se o nome da planilha está contido no nome da API ou vice-versa)
+            match_desc = df_produtos[df_produtos['produto_ref'].str.contains(nome_produto.upper(), regex=False, na=False)]
+            
+            if not match_desc.empty:
+                locais = match_desc['endereco_ref'].unique()
+                endereco = ", ".join(map(str, locais))
+                origem_endereco = "📦 Descrição (Spex)"
+                cor_destaque = "orange"
 
         processed_data.append({
             "Produto": nome_produto,
@@ -123,22 +152,33 @@ def process_results(api_results, df_lotes, df_produtos):
 def main():
     st.title("🔍 Localizador de Estoque PharmUp")
     
-    # Carrega dados
+    # Carregamento
     df_lotes, df_produtos = load_data()
 
-    # Barra de status simples
-    if not df_lotes.empty:
-        st.toast(f"Base de Lotes carregada: {len(df_lotes)} registros", icon="✅")
-    else:
-        st.error("Falha ao carregar Lotes. Verifique o Link CSV.")
+    # --- ÁREA DE DEBUG (Para você ver se carregou certo) ---
+    with st.expander("🛠️ Ver Dados Carregados (Debug)"):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**Tabela Lotes (Top 5):**")
+            if not df_lotes.empty:
+                st.dataframe(df_lotes.head())
+            else:
+                st.warning("Tabela Lotes Vazia ou com Erro")
+        with c2:
+            st.write("**Tabela Produtos (Top 5):**")
+            if not df_produtos.empty:
+                st.dataframe(df_produtos.head())
+            else:
+                st.warning("Tabela Produtos Vazia ou com Erro")
 
+    # Busca
     search_query = st.text_input("", placeholder="Digite Nome ou Lote...")
 
     if st.button("Pesquisar") or search_query:
         if len(search_query) < 2:
             st.warning("Digite pelo menos 2 caracteres.")
         else:
-            with st.spinner("Buscando..."):
+            with st.spinner("Consultando..."):
                 api_data = search_pharmup_api(search_query)
                 
                 if not api_data:
@@ -153,9 +193,10 @@ def main():
                             c1, c2, c3, c4 = st.columns([2, 1.5, 1, 2])
                             with c1:
                                 st.subheader(row['Produto'])
-                                st.caption(f"Lote: {row['Lote']}")
+                                st.code(f"Lote: {row['Lote']}")
                             with c2:
-                                st.metric("Saldo", row['Saldo'], delta=f"Val: {row['Validade']}")
+                                st.metric("Saldo", row['Saldo'])
+                                st.caption(f"Val: {row['Validade']}")
                             with c3:
                                 st.caption(row['Fonte'])
                             with c4:
