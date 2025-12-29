@@ -11,15 +11,17 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Estilo CSS para deixar mais bonito (remove espaços extras e destaca botões)
+# CSS para melhorar a aparência
 st.markdown("""
 <style>
     .stButton button {
         border-radius: 8px;
         font-weight: 600;
     }
-    div[data-testid="stMetricValue"] {
-        font-size: 1.2rem;
+    /* Destaca linhas com descrição vazia */
+    .element-container:has(> iframe) {
+        border: 1px solid #ddd;
+        border-radius: 10px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -39,18 +41,17 @@ supabase = init_supabase()
 
 # --- 2. FUNÇÕES DE DADOS ---
 def carregar_estoque():
-    """Baixa tabela e trata dados 'sujos' como NAN"""
+    """Baixa tabela e trata dados"""
     try:
         response = supabase.table("estoque_unificado").select("*").order("id", desc=True).execute()
         df = pd.DataFrame(response.data)
         
         if not df.empty:
-            # Tratamento visual: Troca "NAN" por vazio para não ficar feio
-            df = df.replace('NAN', '')
-            df = df.replace('nan', '')
-            # Garante que descrição apareça mesmo se for nula
-            df['descricao'] = df['descricao'].fillna('')
-            df['lote'] = df['lote'].fillna('')
+            # Tratamento de Nulos e 'NAN'
+            # Se for nulo ou 'NAN', coloca um placeholder visível para edição
+            df['descricao'] = df['descricao'].fillna('').replace(['NAN', 'nan'], '')
+            df['lote'] = df['lote'].fillna('').replace(['NAN', 'nan'], '')
+            df['endereco'] = df['endereco'].fillna('')
             
         return df
     except Exception as e:
@@ -89,6 +90,7 @@ def excluir_item(id_item):
 # --- 3. JANELAS MODAIS (DIALOGS) ---
 @st.dialog("➕ Adicionar Novo Item")
 def dialog_adicionar():
+    st.write("Preencha os dados do novo material:")
     with st.form("form_add", clear_on_submit=True):
         c1, c2 = st.columns(2)
         lote = c1.text_input("Lote (Opcional)")
@@ -104,7 +106,7 @@ def dialog_adicionar():
             else:
                 if adicionar_item(lote, descricao, endereco, origem):
                     st.toast("✅ Item adicionado com sucesso!")
-                    st.cache_data.clear()
+                    st.cache_data.clear() # Força recarregar os dados
                     time.sleep(1)
                     st.rerun()
 
@@ -114,15 +116,28 @@ def dialog_editar(item):
     
     with st.form("form_edit"):
         c1, c2 = st.columns(2)
-        novo_lote = c1.text_input("Lote", value=item['lote'])
-        novo_end = c2.text_input("Endereço", value=item['endereco'])
-        nova_desc = st.text_input("Descrição", value=item['descricao'])
-        nova_origem = st.selectbox("Origem", ["FRACIONAMENTO", "SPEX/GENERICO", "MANUAL"], index=0) # Simplificado
+        # Garante que os valores não sejam None para não quebrar o input
+        val_lote = item['lote'] if item['lote'] else ""
+        val_end = item['endereco'] if item['endereco'] else ""
+        val_desc = item['descricao'] if item['descricao'] else ""
         
+        novo_lote = c1.text_input("Lote", value=val_lote)
+        novo_end = c2.text_input("Endereço", value=val_end)
+        nova_desc = st.text_input("Descrição", value=val_desc)
+        
+        # Tenta manter a origem atual, se não, usa padrão
+        opcoes_origem = ["FRACIONAMENTO", "SPEX/GENERICO", "MANUAL"]
+        idx_origem = 0
+        if item['origem'] in opcoes_origem:
+            idx_origem = opcoes_origem.index(item['origem'])
+            
+        nova_origem = st.selectbox("Origem", opcoes_origem, index=idx_origem)
+        
+        st.divider()
         col_salvar, col_del = st.columns([3, 1])
         
         save = col_salvar.form_submit_button("💾 Salvar Alterações", type="primary", use_container_width=True)
-        delete = col_del.form_submit_button("🗑️ Excluir", type="secondary", use_container_width=True)
+        delete = col_del.form_submit_button("🗑️ Excluir Item", type="secondary", use_container_width=True)
         
         if save:
             dados = {
@@ -142,7 +157,7 @@ def dialog_editar(item):
 
 # --- 4. INTERFACE PRINCIPAL ---
 def main():
-    # Cabeçalho com Botão de Adição destacado
+    # Cabeçalho
     col_title, col_add = st.columns([6, 1], gap="small")
     with col_title:
         st.title("📦 Controle de Estoque")
@@ -151,13 +166,13 @@ def main():
         if st.button("➕ Novo Item", type="primary", use_container_width=True):
             dialog_adicionar()
 
-    # Carregamento
+    # Carregamento dos dados
     df = carregar_estoque()
     
-    # Barra de Pesquisa Estilizada
+    # Barra de Pesquisa
     busca = st.text_input("🔎 Pesquisar no Estoque", placeholder="Digite nome, lote ou endereço...", label_visibility="collapsed")
     
-    # Filtros
+    # Filtro local
     df_show = df.copy()
     if not df.empty and busca:
         termo = busca.upper()
@@ -168,12 +183,11 @@ def main():
         )
         df_show = df_show[mask]
 
-    # Indicador de Resultados
     st.caption(f"Encontrados: **{len(df_show)}** itens")
 
-    # TABELA PRINCIPAL
-    # Usamos o event de seleção para abrir edição
-    selection = st.dataframe(
+    # TABELA INTERATIVA
+    # A correção do erro está aqui: selection_mode="single-row" (com hífen)
+    event = st.dataframe(
         df_show,
         column_config={
             "id": st.column_config.NumberColumn("ID", width="small", disabled=True),
@@ -181,26 +195,27 @@ def main():
             "descricao": st.column_config.TextColumn("📝 Descrição", width="large"),
             "endereco": st.column_config.TextColumn("📍 Endereço", width="small"),
             "origem": st.column_config.Column("🏷️ Origem", width="small"),
-            "created_at": None # Oculta data técnica
+            "created_at": None
         },
         use_container_width=True,
         hide_index=True,
-        selection_mode="single_row", # Permite selecionar 1 linha
-        on_select="rerun", # Recarrega ao selecionar para abrir o modal
+        selection_mode="single-row",  # CORRIGIDO: hífen em vez de underline
+        on_select="rerun",
         height=500
     )
 
     # Lógica de Seleção -> Abrir Edição
-    if len(selection.selection["rows"]) > 0:
-        index_selecionado = selection.selection["rows"][0]
-        # Recupera os dados da linha selecionada (baseado no índice visual)
+    # Verifica se houve seleção de linha
+    if len(event.selection["rows"]) > 0:
+        index_selecionado = event.selection["rows"][0]
+        # Recupera a linha correta do dataframe filtrado
         item_selecionado = df_show.iloc[index_selecionado]
         
-        # Abre o modal de edição automaticamente ou mostra botão
-        # (O Streamlit não abre dialog direto no rerun sem hack, então mostramos um botão fixo embaixo ou aviso)
-        
+        # Mostra botão de ação fixo ou mensagem
         st.info(f"Item selecionado: **{item_selecionado['descricao']}**")
-        if st.button("✏️ Editar Item Selecionado", type="primary", use_container_width=True):
+        
+        # Botão para abrir o modal de edição
+        if st.button("✏️ Editar Item Selecionado", type="primary", use_container_width=True, key="btn_edit_main"):
             dialog_editar(item_selecionado)
 
 if __name__ == "__main__":
