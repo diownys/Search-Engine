@@ -13,54 +13,63 @@ st.set_page_config(
 @st.cache_data(ttl=60)
 def load_data():
     """
-    Lê os dados e renomeia as colunas pela posição, ignorando os nomes originais.
+    Lê os dados e renomeia as colunas pela POSIÇÃO, ignorando os nomes originais.
+    Col 0 -> Chave de Busca
+    Col 1 -> Endereço
     """
     # Recupera links dos Secrets
     try:
         url_lotes = st.secrets["url_lotes"]
         url_produtos = st.secrets["url_produtos"]
     except Exception:
-        # Fallback para teste local caso não tenha secrets
-        st.error("Configure os Secrets (url_lotes e url_produtos)!")
+        st.error("⚠️ Configure os Secrets (url_lotes e url_produtos) no painel do Streamlit!")
         return pd.DataFrame(), pd.DataFrame()
 
     df_lotes = pd.DataFrame()
     df_produtos = pd.DataFrame()
 
-    # --- CARREGA LOTES ---
+    # --- CARREGA LOTES (Tabela 1) ---
     try:
         df_lotes = pd.read_csv(url_lotes)
-        # SE A TABELA TIVER DADOS, RENOMEAMOS AS COLUNAS PELA POSIÇÃO
+        
+        # Se tiver pelo menos 2 colunas, renomeia pela posição
         if len(df_lotes.columns) >= 2:
-            # Pega o nome real da 1ª e 2ª coluna
-            col_lote_real = df_lotes.columns[0]
-            col_end_real = df_lotes.columns[1]
+            # Pega o nome atual da coluna 0 e da coluna 1
+            nome_col0 = df_lotes.columns[0]
+            nome_col1 = df_lotes.columns[1]
             
-            # Renomeia para um padrão interno nosso
-            df_lotes = df_lotes.rename(columns={col_lote_real: 'lote_ref', col_end_real: 'endereco_ref'})
+            # Renomeia para nosso padrão interno
+            df_lotes = df_lotes.rename(columns={nome_col0: 'lote_ref', nome_col1: 'endereco_ref'})
             
-            # Limpeza
+            # Limpeza dos dados
             df_lotes['lote_ref'] = df_lotes['lote_ref'].astype(str).str.strip().str.upper()
             df_lotes['endereco_ref'] = df_lotes['endereco_ref'].astype(str).str.strip()
+        else:
+            st.error(f"Erro: A planilha de Lotes tem menos de 2 colunas.")
+            
     except Exception as e:
-        st.error(f"Erro ao ler Lotes: {e}")
+        st.error(f"Falha ao carregar Lotes (Link CSV inválido?): {e}")
 
-    # --- CARREGA PRODUTOS ---
+    # --- CARREGA PRODUTOS (Tabela 2) ---
     try:
         df_produtos = pd.read_csv(url_produtos)
+        
         if len(df_produtos.columns) >= 2:
-            # Pega o nome real da 1ª e 2ª coluna
-            col_prod_real = df_produtos.columns[0] # Ex: "Produtos"
-            col_end_real = df_produtos.columns[1]  # Ex: "Endereço"
+            # Pega o nome atual da coluna 0 e da coluna 1
+            nome_col0 = df_produtos.columns[0]
+            nome_col1 = df_produtos.columns[1]
             
             # Renomeia
-            df_produtos = df_produtos.rename(columns={col_prod_real: 'produto_ref', col_end_real: 'endereco_ref'})
+            df_produtos = df_produtos.rename(columns={nome_col0: 'produto_ref', nome_col1: 'endereco_ref'})
             
             # Limpeza
             df_produtos['produto_ref'] = df_produtos['produto_ref'].astype(str).str.strip().str.upper()
             df_produtos['endereco_ref'] = df_produtos['endereco_ref'].astype(str).str.strip()
+        else:
+            st.error(f"Erro: A planilha de Produtos tem menos de 2 colunas.")
+
     except Exception as e:
-        st.error(f"Erro ao ler Produtos: {e}")
+        st.error(f"Falha ao carregar Produtos (Link CSV inválido?): {e}")
 
     return df_lotes, df_produtos
 
@@ -95,7 +104,7 @@ def search_pharmup_api(search_term):
     except Exception:
         return []
 
-# --- 3. LÓGICA DE CRUZAMENTO (ATUALIZADA) ---
+# --- 3. LÓGICA DE CRUZAMENTO ---
 def process_results(api_results, df_lotes, df_produtos):
     processed_data = []
 
@@ -105,7 +114,6 @@ def process_results(api_results, df_lotes, df_produtos):
         nome_produto = str(item.get('produtoDescricao', '')).strip()
         saldo = item.get('quantidadeAtual', 0)
         unidade = item.get('unidadeMedidaSigla', '')
-        
         raw_date = item.get('dataValidade', '')
         validade = raw_date[:10] if raw_date else ""
 
@@ -114,8 +122,9 @@ def process_results(api_results, df_lotes, df_produtos):
         cor_destaque = "red"
 
         # 1. TENTA BUSCAR PELO LOTE (Tabela 1 - Fracionamento)
-        # Verifica se df_lotes tem dados e colunas corretas
+        # Verifica se carregou corretamente antes de buscar
         if not df_lotes.empty and 'lote_ref' in df_lotes.columns:
+            # Busca exata do lote
             match_lote = df_lotes[df_lotes['lote_ref'] == lote_api.upper()]
             
             if not match_lote.empty:
@@ -125,11 +134,15 @@ def process_results(api_results, df_lotes, df_produtos):
                 cor_destaque = "green"
         
         # 2. SE FALHAR, TENTA PELA DESCRIÇÃO (Tabela 2 - Spex)
-        # Só entra aqui se não achou pelo lote
         if cor_destaque == "red" and not df_produtos.empty and 'produto_ref' in df_produtos.columns:
-            # Busca parcial (se o nome da planilha está contido no nome da API ou vice-versa)
-            match_desc = df_produtos[df_produtos['produto_ref'].str.contains(nome_produto.upper(), regex=False, na=False)]
+            # Busca se o nome da planilha está DENTRO do nome do PharmUp
+            # Ex: Planilha tem "DIPIRONA", PharmUp tem "DIPIRONA SODICA". Vai achar.
+            match_desc = df_produtos[df_produtos['produto_ref'].apply(lambda x: x in nome_produto.upper())]
             
+            # Se não achou, tenta o inverso (Nome do PharmUp dentro da Planilha)
+            if match_desc.empty:
+                 match_desc = df_produtos[df_produtos['produto_ref'].str.contains(nome_produto.upper(), regex=False, na=False)]
+
             if not match_desc.empty:
                 locais = match_desc['endereco_ref'].unique()
                 endereco = ", ".join(map(str, locais))
@@ -155,21 +168,24 @@ def main():
     # Carregamento
     df_lotes, df_produtos = load_data()
 
-    # --- ÁREA DE DEBUG (Para você ver se carregou certo) ---
-    with st.expander("🛠️ Ver Dados Carregados (Debug)"):
+    # --- DEBUG VISUAL (Para verificar se carregou) ---
+    with st.expander("🛠️ Debug: Ver Tabelas Carregadas"):
         c1, c2 = st.columns(2)
         with c1:
-            st.write("**Tabela Lotes (Top 5):**")
-            if not df_lotes.empty:
-                st.dataframe(df_lotes.head())
+            st.write("**Tabela Lotes (Fracionamento):**")
+            if df_lotes.empty:
+                st.error("❌ Tabela vazia ou erro no Link CSV.")
             else:
-                st.warning("Tabela Lotes Vazia ou com Erro")
+                st.dataframe(df_lotes.head(3))
+                st.caption(f"Colunas detectadas: {list(df_lotes.columns)}")
+        
         with c2:
-            st.write("**Tabela Produtos (Top 5):**")
-            if not df_produtos.empty:
-                st.dataframe(df_produtos.head())
+            st.write("**Tabela Produtos (Spex):**")
+            if df_produtos.empty:
+                st.error("❌ Tabela vazia ou erro no Link CSV.")
             else:
-                st.warning("Tabela Produtos Vazia ou com Erro")
+                st.dataframe(df_produtos.head(3))
+                st.caption(f"Colunas detectadas: {list(df_produtos.columns)}")
 
     # Busca
     search_query = st.text_input("", placeholder="Digite Nome ou Lote...")
@@ -178,7 +194,7 @@ def main():
         if len(search_query) < 2:
             st.warning("Digite pelo menos 2 caracteres.")
         else:
-            with st.spinner("Consultando..."):
+            with st.spinner("Buscando no PharmUp..."):
                 api_data = search_pharmup_api(search_query)
                 
                 if not api_data:
