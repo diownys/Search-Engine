@@ -24,8 +24,8 @@ def load_data():
             df_lotes = df_lotes.iloc[:, :2] # Pega col 1 e 2
             df_lotes.columns = ['lote_ref', 'endereco_ref']
             df_lotes['lote_ref'] = df_lotes['lote_ref'].astype(str).str.strip().str.upper()
-    except Exception as e:
-        pass # Silencia erro visual se falhar
+    except Exception:
+        pass
 
     # Tabela 2: Produtos
     try:
@@ -34,63 +34,62 @@ def load_data():
             df_produtos = df_produtos.iloc[:, :2] # Pega col 1 e 2
             df_produtos.columns = ['produto_ref', 'endereco_ref']
             df_produtos['produto_ref'] = df_produtos['produto_ref'].astype(str).str.strip().str.upper()
-    except Exception as e:
+    except Exception:
         pass
 
     return df_lotes, df_produtos
 
 # --- 2. AUTENTICAÇÃO AUTOMÁTICA (LOGIN) ---
-@st.cache_data(ttl=3600) # Cache do Token por 1 hora
+@st.cache_data(ttl=3000) # Cache de 50 minutos (Token costuma expirar em 1h)
 def get_auth_token():
     """
-    Faz login no PharmUp e retorna o Token Bearer.
+    Faz login no PharmUp e retorna APENAS a string do Token.
     """
     try:
         config = st.secrets["pharmup"]
         login_url = config["login_url"]
         
-        # Envia login e senha como parâmetros na URL (Query String)
+        # Envia login e senha na URL
         params = {
             "login": config["username"],
             "senha": config["password"]
         }
         
-        headers = {
-             "User-Agent": config["user_agent"]
-        }
+        headers = { "User-Agent": config["user_agent"] }
 
-        # Faz o POST para pegar o token
         response = requests.post(login_url, params=params, headers=headers, timeout=10)
         
         if response.status_code == 200:
-            # O token vem direto no corpo da resposta ou dentro de um JSON
             try:
-                # Tenta ler como JSON
-                return response.json() 
+                # O servidor retorna {"token": "eyJ..."}
+                data = response.json()
+                # AQUI ESTAVA O ERRO: Precisamos pegar o valor da chave 'token'
+                token_str = data.get("token") 
+                return token_str
             except:
-                # Se não for JSON, pega o texto puro (o token bruto)
+                # Fallback se vier texto puro
                 return response.text.strip('"')
         else:
-            st.error(f"Falha no Login: {response.status_code}")
+            st.error(f"Falha no Login Automático: Status {response.status_code}")
             return None
     except Exception as e:
-        st.error(f"Erro ao tentar logar: {e}")
+        st.error(f"Erro de conexão no Login: {e}")
         return None
 
 # --- 3. CONEXÃO COM A BUSCA ---
 def search_pharmup_api(search_term):
-    # 1. Obtém o Token (faz login se precisar)
+    # 1. Obtém o Token Limpo
     token = get_auth_token()
     
     if not token:
-        return [], 401, "Falha ao obter Token de Login"
+        return [], 401, "Não foi possível realizar o login automático."
 
     try:
         config = st.secrets["pharmup"]
         api_url = f"{config['base_url']}/ProdutoLote/ListProdutoLote"
         
         headers = {
-            "Authorization": f"Bearer {token}", # Usa o token gerado
+            "Authorization": f"Bearer {token}", # Agora o token vai limpo!
             "User-Agent": config["user_agent"],
             "Referer": config["referer"],
             "Origin": config["origin"],
@@ -109,6 +108,12 @@ def search_pharmup_api(search_term):
 
     try:
         response = requests.get(api_url, params=params, headers=headers, timeout=10)
+        
+        # Se o token expirou no meio do caminho, limpa o cache e tenta avisar
+        if response.status_code == 401:
+             st.cache_data.clear() # Limpa cache para forçar novo login na próxima
+             return [], 401, "Token expirado. Tente clicar em pesquisar novamente."
+
         try:
             data = response.json().get('list', [])
         except:
@@ -123,12 +128,10 @@ def main():
     
     df_lotes, df_produtos = load_data()
 
-    # Barra de Status Discreta
-    status_col1, status_col2 = st.columns(2)
-    if df_lotes.empty:
-        status_col1.warning("⚠️ Lotes Offline")
-    if df_produtos.empty:
-        status_col2.warning("⚠️ Produtos Offline")
+    # Status
+    c1, c2 = st.columns(2)
+    if df_lotes.empty: c1.warning("⚠️ Lotes Offline")
+    if df_produtos.empty: c2.warning("⚠️ Produtos Offline")
 
     search_query = st.text_input("Pesquisar", placeholder="Digite Nome ou Lote...")
 
@@ -138,10 +141,10 @@ def main():
 
         if not api_data:
             if status == 200:
-                st.info("Nenhum registro encontrado para essa busca.")
+                st.info("Nenhum registro encontrado.")
             else:
                 st.error(f"Erro na API: {status}")
-                with st.expander("Detalhes Técnicos"):
+                with st.expander("Ver Detalhes do Erro"):
                     st.code(raw_text)
         else:
             st.success(f"Encontrados {len(api_data)} itens")
@@ -151,10 +154,9 @@ def main():
                 lote = str(item.get('descricao', 'Unknown')).strip()
                 saldo = item.get('quantidadeAtual', 0)
                 
-                # Lógica de Endereçamento
                 locais = []
                 origem = ""
-                cor = "#eee" # Cinza padrão
+                cor = "#f0f2f6" # Cinza padrão
 
                 # 1. Lote
                 if not df_lotes.empty:
@@ -162,30 +164,28 @@ def main():
                     if not match.empty:
                         locais = match['endereco_ref'].unique()
                         origem = "Lote"
-                        cor = "#d4edda" # Verde claro
+                        cor = "#d1e7dd" # Verde
 
                 # 2. Produto (apenas se não achou por lote)
                 if not locais and not df_produtos.empty:
-                    # Tenta match exato ou parcial
                     match = df_produtos[df_produtos['produto_ref'].str.contains(nome.upper(), na=False)]
                     if not match.empty:
                         locais = match['endereco_ref'].unique()
                         origem = "Nome Aprox."
-                        cor = "#fff3cd" # Amarelo claro
+                        cor = "#fff3cd" # Amarelo
 
                 end_str = ", ".join(map(str, locais)) if len(locais) > 0 else "Não Localizado"
                 
-                # Layout do Card
                 st.markdown(f"""
-                <div style="background-color: {cor}; padding:15px; border-radius:10px; margin-bottom:10px; border:1px solid #ccc; color: black;">
-                    <h4 style="margin:0; color:black;">{nome}</h4>
-                    <div style="display:flex; justify-content:space-between; margin-top:5px;">
+                <div style="background-color: {cor}; padding:15px; border-radius:10px; margin-bottom:10px; border:1px solid #ddd; color:black;">
+                    <h4 style="margin:0; color:black">{nome}</h4>
+                    <div style="display:flex; justify-content:space-between; margin-top:5px; color:#333;">
                         <span>📦 Lote: <b>{lote}</b></span>
                         <span>📊 Saldo: <b>{saldo}</b></span>
                     </div>
-                    <hr style="margin:5px 0; border-color:#bbb;">
-                    <div style="font-size:1.1em;">
-                        📍 <b>{end_str}</b> <small>({origem})</small>
+                    <hr style="margin:5px 0; border-color:#ccc;">
+                    <div style="font-size:1.1em; font-weight:bold; color:black;">
+                        📍 {end_str} <span style="font-size:0.8em; font-weight:normal;">({origem})</span>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
