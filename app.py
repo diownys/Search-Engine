@@ -1,8 +1,28 @@
 import streamlit as st
 import pandas as pd
 from supabase import create_client
+import time
 
-st.set_page_config(page_title="Consulta Supabase", page_icon="🔍", layout="wide")
+# --- CONFIGURAÇÃO VISUAL ---
+st.set_page_config(
+    page_title="Controle de Estoque", 
+    page_icon="📦", 
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Estilo CSS para deixar mais bonito (remove espaços extras e destaca botões)
+st.markdown("""
+<style>
+    .stButton button {
+        border-radius: 8px;
+        font-weight: 600;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.2rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # --- 1. CONEXÃO COM O SUPABASE ---
 @st.cache_resource
@@ -12,72 +32,53 @@ def init_supabase():
         key = st.secrets["supabase"]["key"]
         return create_client(url, key)
     except Exception as e:
-        st.error(f"❌ Erro nos Secrets: {e}")
+        st.error(f"❌ Erro de Conexão: {e}")
         return None
 
 supabase = init_supabase()
 
-# --- 2. FUNÇÕES DE BANCO DE DADOS ---
+# --- 2. FUNÇÕES DE DADOS ---
 def carregar_estoque():
-    """Baixa toda a tabela 'estoque_unificado' do Supabase"""
+    """Baixa tabela e trata dados 'sujos' como NAN"""
     try:
-        # Seleciona tudo e ordena pelos mais recentes (maior ID)
         response = supabase.table("estoque_unificado").select("*").order("id", desc=True).execute()
         df = pd.DataFrame(response.data)
+        
+        if not df.empty:
+            # Tratamento visual: Troca "NAN" por vazio para não ficar feio
+            df = df.replace('NAN', '')
+            df = df.replace('nan', '')
+            # Garante que descrição apareça mesmo se for nula
+            df['descricao'] = df['descricao'].fillna('')
+            df['lote'] = df['lote'].fillna('')
+            
         return df
     except Exception as e:
-        st.error(f"Erro ao conectar no banco: {e}")
+        st.error(f"Erro ao carregar: {e}")
         return pd.DataFrame()
 
-def salvar_alteracoes(df_editado, df_original):
-    """
-    Compara o dataframe editado na tela com o original e salva as diferenças.
-    Suporta: Edição de células e Adição de novas linhas.
-    """
+def adicionar_item(lote, descricao, endereco, origem):
     try:
-        # Iterar sobre o DF editado para achar mudanças
-        for index, row in df_editado.iterrows():
-            # A) SE TEM ID, É UMA LINHA EXISTENTE (EDIÇÃO)
-            if row.get('id') and pd.notna(row['id']):
-                # Busca a linha original correspondente para comparar
-                linha_original = df_original[df_original['id'] == row['id']]
-                
-                if not linha_original.empty:
-                    orig = linha_original.iloc[0]
-                    
-                    # Verifica se houve mudança em campos chave
-                    if (row['endereco'] != orig['endereco'] or 
-                        row['descricao'] != orig['descricao'] or 
-                        row['lote'] != orig['lote'] or
-                        row['origem'] != orig['origem']):
-                        
-                        # Atualiza no Supabase
-                        supabase.table("estoque_unificado").update({
-                            "endereco": row['endereco'],
-                            "descricao": row['descricao'],
-                            "lote": row['lote'],
-                            "origem": row['origem']
-                        }).eq("id", row['id']).execute()
-
-            # B) SE NÃO TEM ID (OU É NaN), É UMA NOVA LINHA (INSERÇÃO)
-            else:
-                # Só insere se tiver pelo menos uma descrição preenchida
-                if row['descricao']:
-                    payload = {
-                        "lote": row['lote'] if row['lote'] else None,
-                        "descricao": row['descricao'],
-                        "endereco": row['endereco'],
-                        "origem": row['origem'] if row['origem'] else "MANUAL"
-                    }
-                    supabase.table("estoque_unificado").insert(payload).execute()
-        
+        supabase.table("estoque_unificado").insert({
+            "lote": lote.upper().strip() if lote else None,
+            "descricao": descricao.upper().strip(),
+            "endereco": endereco.upper().strip(),
+            "origem": origem
+        }).execute()
         return True
     except Exception as e:
-        st.error(f"Erro ao salvar: {e}")
+        st.error(f"Erro ao adicionar: {e}")
+        return False
+
+def atualizar_item(id_item, dados):
+    try:
+        supabase.table("estoque_unificado").update(dados).eq("id", id_item).execute()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao atualizar: {e}")
         return False
 
 def excluir_item(id_item):
-    """Remove um item do banco pelo ID"""
     try:
         supabase.table("estoque_unificado").delete().eq("id", id_item).execute()
         return True
@@ -85,103 +86,122 @@ def excluir_item(id_item):
         st.error(f"Erro ao excluir: {e}")
         return False
 
-# --- 3. INTERFACE DO USUÁRIO ---
-def main():
-    st.title("🔍 Consulta de Estoque (Supabase)")
-    
-    # Botão de Recarregar
-    if st.button("🔄 Atualizar Dados"):
-        st.cache_data.clear()
-        st.rerun()
-
-    # Carrega dados
-    df = carregar_estoque()
-
-    if df.empty:
-        st.warning("O banco de dados está vazio ou não foi possível conectar.")
-        # Cria estrutura vazia para não quebrar a tela
-        df = pd.DataFrame(columns=["id", "lote", "descricao", "endereco", "origem"])
-
-    # --- BARRA LATERAL DE FILTROS ---
-    with st.sidebar:
-        st.header("Filtros")
-        filtro_origem = st.multiselect(
-            "Origem do Dado", 
-            options=df['origem'].unique() if not df.empty else [],
-            default=df['origem'].unique() if not df.empty else []
-        )
+# --- 3. JANELAS MODAIS (DIALOGS) ---
+@st.dialog("➕ Adicionar Novo Item")
+def dialog_adicionar():
+    with st.form("form_add", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        lote = c1.text_input("Lote (Opcional)")
+        endereco = c2.text_input("Endereço *", placeholder="Ex: A-10")
+        descricao = st.text_input("Descrição / Produto *", placeholder="Ex: DIPIRONA 500MG")
+        origem = st.selectbox("Origem", ["MANUAL", "FRACIONAMENTO", "SPEX/GENERICO"])
         
-        st.divider()
-        st.info("💡 Dica: Para adicionar um item novo, preencha a linha vazia no final da tabela.")
-
-    # --- BARRA DE PESQUISA PRINCIPAL ---
-    termo_busca = st.text_input("🔎 Pesquisar...", placeholder="Digite nome, lote ou endereço")
-
-    # --- APLICAÇÃO DOS FILTROS (Visual apenas) ---
-    df_exibicao = df.copy()
-
-    # 1. Filtro de Texto
-    if termo_busca:
-        termo = termo_busca.upper()
-        # Converte tudo para string e maiúsculo para buscar
-        mascara = (
-            df_exibicao['descricao'].astype(str).str.upper().str.contains(termo, na=False) |
-            df_exibicao['lote'].astype(str).str.upper().str.contains(termo, na=False) |
-            df_exibicao['endereco'].astype(str).str.upper().str.contains(termo, na=False)
-        )
-        df_exibicao = df_exibicao[mascara]
-
-    # 2. Filtro de Origem
-    if filtro_origem:
-        df_exibicao = df_exibicao[df_exibicao['origem'].isin(filtro_origem)]
-
-    # Mostra total encontrado
-    st.caption(f"Exibindo {len(df_exibicao)} registros de {len(df)} totais.")
-
-    # --- TABELA EDITÁVEL (DATA EDITOR) ---
-    # num_rows="dynamic" permite adicionar linhas
-    df_editado = st.data_editor(
-        df_exibicao,
-        column_config={
-            "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
-            "lote": st.column_config.TextColumn("Lote", width="medium"),
-            "descricao": st.column_config.TextColumn("Descrição / Produto", width="large"),
-            "endereco": st.column_config.TextColumn("Endereço", width="small"),
-            "origem": st.column_config.SelectboxColumn(
-                "Origem",
-                options=["FRACIONAMENTO", "SPEX/GENERICO", "MANUAL"],
-                width="medium",
-                required=True
-            ),
-            "created_at": st.column_config.DatetimeColumn("Criado em", disabled=True, format="DD/MM/YYYY HH:mm")
-        },
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic", 
-        key="editor_estoque"
-    )
-
-    # --- BOTÃO DE SALVAR ---
-    # Só mostramos o botão se houver dados na tela, para evitar salvar vazio
-    col_save, col_del = st.columns([4, 1])
-    
-    with col_save:
-        if st.button("💾 Salvar Alterações", type="primary"):
-            with st.spinner("Salvando no Supabase..."):
-                if salvar_alteracoes(df_editado, df):
-                    st.success("Dados atualizados com sucesso!")
-                    import time
+        submitted = st.form_submit_button("Salvar Item", type="primary", use_container_width=True)
+        
+        if submitted:
+            if not descricao or not endereco:
+                st.error("Preencha Descrição e Endereço!")
+            else:
+                if adicionar_item(lote, descricao, endereco, origem):
+                    st.toast("✅ Item adicionado com sucesso!")
+                    st.cache_data.clear()
                     time.sleep(1)
                     st.rerun()
 
-    # --- ÁREA DE EXCLUSÃO (Opcional) ---
-    with col_del:
-        with st.popover("🗑️ Excluir Item"):
-            id_para_excluir = st.number_input("ID do item para excluir", step=1, min_value=1)
-            if st.button("Confirmar Exclusão"):
-                if excluir_item(id_para_excluir):
-                    st.toast(f"Item {id_para_excluir} excluído!")
-                    st.rerun()
+@st.dialog("✏️ Editar Item")
+def dialog_editar(item):
+    st.caption(f"Editando ID: {item['id']}")
+    
+    with st.form("form_edit"):
+        c1, c2 = st.columns(2)
+        novo_lote = c1.text_input("Lote", value=item['lote'])
+        novo_end = c2.text_input("Endereço", value=item['endereco'])
+        nova_desc = st.text_input("Descrição", value=item['descricao'])
+        nova_origem = st.selectbox("Origem", ["FRACIONAMENTO", "SPEX/GENERICO", "MANUAL"], index=0) # Simplificado
+        
+        col_salvar, col_del = st.columns([3, 1])
+        
+        save = col_salvar.form_submit_button("💾 Salvar Alterações", type="primary", use_container_width=True)
+        delete = col_del.form_submit_button("🗑️ Excluir", type="secondary", use_container_width=True)
+        
+        if save:
+            dados = {
+                "lote": novo_lote.upper().strip(),
+                "endereco": novo_end.upper().strip(),
+                "descricao": nova_desc.upper().strip(),
+                "origem": nova_origem
+            }
+            if atualizar_item(item['id'], dados):
+                st.toast("✅ Atualizado!")
+                st.rerun()
+        
+        if delete:
+            if excluir_item(item['id']):
+                st.toast("🗑️ Item excluído!")
+                st.rerun()
+
+# --- 4. INTERFACE PRINCIPAL ---
+def main():
+    # Cabeçalho com Botão de Adição destacado
+    col_title, col_add = st.columns([6, 1], gap="small")
+    with col_title:
+        st.title("📦 Controle de Estoque")
+    with col_add:
+        st.write("") # Espaçamento
+        if st.button("➕ Novo Item", type="primary", use_container_width=True):
+            dialog_adicionar()
+
+    # Carregamento
+    df = carregar_estoque()
+    
+    # Barra de Pesquisa Estilizada
+    busca = st.text_input("🔎 Pesquisar no Estoque", placeholder="Digite nome, lote ou endereço...", label_visibility="collapsed")
+    
+    # Filtros
+    df_show = df.copy()
+    if not df.empty and busca:
+        termo = busca.upper()
+        mask = (
+            df_show['descricao'].str.upper().str.contains(termo, na=False) |
+            df_show['lote'].str.upper().str.contains(termo, na=False) |
+            df_show['endereco'].str.upper().str.contains(termo, na=False)
+        )
+        df_show = df_show[mask]
+
+    # Indicador de Resultados
+    st.caption(f"Encontrados: **{len(df_show)}** itens")
+
+    # TABELA PRINCIPAL
+    # Usamos o event de seleção para abrir edição
+    selection = st.dataframe(
+        df_show,
+        column_config={
+            "id": st.column_config.NumberColumn("ID", width="small", disabled=True),
+            "lote": st.column_config.TextColumn("📦 Lote", width="medium"),
+            "descricao": st.column_config.TextColumn("📝 Descrição", width="large"),
+            "endereco": st.column_config.TextColumn("📍 Endereço", width="small"),
+            "origem": st.column_config.Column("🏷️ Origem", width="small"),
+            "created_at": None # Oculta data técnica
+        },
+        use_container_width=True,
+        hide_index=True,
+        selection_mode="single_row", # Permite selecionar 1 linha
+        on_select="rerun", # Recarrega ao selecionar para abrir o modal
+        height=500
+    )
+
+    # Lógica de Seleção -> Abrir Edição
+    if len(selection.selection["rows"]) > 0:
+        index_selecionado = selection.selection["rows"][0]
+        # Recupera os dados da linha selecionada (baseado no índice visual)
+        item_selecionado = df_show.iloc[index_selecionado]
+        
+        # Abre o modal de edição automaticamente ou mostra botão
+        # (O Streamlit não abre dialog direto no rerun sem hack, então mostramos um botão fixo embaixo ou aviso)
+        
+        st.info(f"Item selecionado: **{item_selecionado['descricao']}**")
+        if st.button("✏️ Editar Item Selecionado", type="primary", use_container_width=True):
+            dialog_editar(item_selecionado)
 
 if __name__ == "__main__":
     main()
