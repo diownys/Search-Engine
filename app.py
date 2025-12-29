@@ -6,12 +6,13 @@ import time
 # --- CONFIGURAÇÃO VISUAL ---
 st.set_page_config(page_title="Localizador de Estoque", page_icon="📦", layout="wide")
 
-# CSS para replicar o estilo dos cards e botões
+# CSS: Cards, Botões e Layout
 st.markdown("""
 <style>
     .stButton button { border-radius: 8px; font-weight: 600; }
     div[data-testid="stMetricValue"] { font-size: 1.1rem; }
-    /* Estilo para os Cards de Resultado */
+    
+    /* Estilo dos Cards */
     .stock-card {
         padding: 15px; 
         border-radius: 8px; 
@@ -26,19 +27,19 @@ st.markdown("""
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 # --- 2. CARREGAMENTO DOS DADOS ---
-@st.cache_data(ttl=10) # Cache curto para atualizar rápido após edição
+@st.cache_data(ttl=10)
 def load_data():
     try:
-        # Lê aba LOTES (Fracionamento)
+        # Aba LOTES
         df_lotes = conn.read(worksheet="Lotes", usecols=[0, 1, 2], ttl=0)
         df_lotes.columns = ['Lote', 'Descricao', 'Endereco']
         df_lotes['Origem'] = 'FRACIONAMENTO'
         df_lotes['ID_Linha'] = df_lotes.index
 
-        # Lê aba PRODUTOS (Genérico)
+        # Aba PRODUTOS
         df_produtos = conn.read(worksheet="Produtos", usecols=[0, 1], ttl=0)
         df_produtos.columns = ['Descricao', 'Endereco']
-        df_produtos['Lote'] = '' # Vazio para produtos sem lote
+        df_produtos['Lote'] = ''
         df_produtos['Origem'] = 'SPEX/GENERICO'
         df_produtos['ID_Linha'] = df_produtos.index
 
@@ -46,7 +47,7 @@ def load_data():
         df_total = pd.concat([df_lotes, df_produtos], ignore_index=True)
         df_total = df_total.fillna("") 
         
-        # Limpeza para padronizar busca
+        # Padronização
         df_total['Descricao'] = df_total['Descricao'].astype(str).str.strip().str.upper()
         df_total['Lote'] = df_total['Lote'].astype(str).str.strip().str.upper()
         df_total['Endereco'] = df_total['Endereco'].astype(str).str.strip().str.upper()
@@ -56,12 +57,11 @@ def load_data():
         st.error(f"Erro ao carregar dados: {e}")
         return pd.DataFrame()
 
-# --- 3. FUNÇÃO DE BUSCA LOCAL ---
+# --- 3. BUSCA LOCAL ---
 def search_local(query, df):
     query = query.upper().strip()
     if query == "": return []
     
-    # Filtra no DataFrame
     mask = (
         df['Descricao'].str.contains(query, na=False) | 
         df['Lote'].str.contains(query, na=False) |
@@ -71,21 +71,19 @@ def search_local(query, df):
     
     results = []
     for _, row in matches.iterrows():
-        # Define cor baseada na origem (igual ao seu exemplo)
         cor = "#d1e7dd" if row['Origem'] == 'FRACIONAMENTO' else "#fff3cd"
-        
         results.append({
             "nome": row['Descricao'],
             "lote": row['Lote'] if row['Lote'] else "N/A",
             "endereco": row['Endereco'],
             "origem": row['Origem'],
             "cor": cor,
-            "raw_data": row # Guarda dados originais para edição
+            "raw_data": row
         })
     return results
 
-# --- 4. FUNÇÃO DE SALVAR NO SHEETS ---
-def salvar_no_sheets(item, novo_lote, nova_desc, novo_end):
+# --- 4. SALVAR EDIÇÃO ---
+def salvar_edicao(item, novo_lote, nova_desc, novo_end):
     try:
         nome_aba = "Lotes" if item['Origem'] == "FRACIONAMENTO" else "Produtos"
         df_atual = conn.read(worksheet=nome_aba, ttl=0)
@@ -102,13 +100,42 @@ def salvar_no_sheets(item, novo_lote, nova_desc, novo_end):
         conn.update(worksheet=nome_aba, data=df_atual)
         return True
     except Exception as e:
-        st.error(f"Erro ao salvar: {e}")
+        st.error(f"Erro ao salvar edição: {e}")
         return False
 
-# --- 5. MODAL DE EDIÇÃO ---
+# --- 5. ADICIONAR NOVO ITEM ---
+def adicionar_item(origem, lote, descricao, endereco):
+    try:
+        nome_aba = "Lotes" if origem == "FRACIONAMENTO" else "Produtos"
+        
+        # 1. Lê a tabela atual
+        df_atual = conn.read(worksheet=nome_aba, ttl=0)
+        
+        # 2. Cria a nova linha
+        if nome_aba == "Lotes":
+            nova_linha = pd.DataFrame([{
+                df_atual.columns[0]: lote.upper(),
+                df_atual.columns[1]: descricao.upper(),
+                df_atual.columns[2]: endereco.upper()
+            }])
+        else:
+            nova_linha = pd.DataFrame([{
+                df_atual.columns[0]: descricao.upper(),
+                df_atual.columns[1]: endereco.upper()
+            }])
+            
+        # 3. Adiciona ao final e salva
+        df_atualizado = pd.concat([df_atual, nova_linha], ignore_index=True)
+        conn.update(worksheet=nome_aba, data=df_atualizado)
+        return True
+    except Exception as e:
+        st.error(f"Erro ao adicionar: {e}")
+        return False
+
+# --- 6. MODAIS (DIALOGS) ---
 @st.dialog("✏️ Editar Item")
 def dialog_editar(item_dict):
-    item = item_dict['raw_data'] # Recupera o objeto row original
+    item = item_dict['raw_data']
     st.caption(f"Editando: {item['Descricao']}")
     
     with st.form("form_edit"):
@@ -124,30 +151,67 @@ def dialog_editar(item_dict):
         
         if st.form_submit_button("💾 Salvar Alterações", type="primary", use_container_width=True):
             with st.spinner("Salvando..."):
-                if salvar_no_sheets(item, val_lote, val_desc, val_end):
+                if salvar_edicao(item, val_lote, val_desc, val_end):
                     st.toast("✅ Salvo com sucesso!")
                     st.cache_data.clear()
                     time.sleep(1)
                     st.rerun()
 
-# --- 6. INTERFACE PRINCIPAL ---
+@st.dialog("➕ Novo Material")
+def dialog_adicionar():
+    st.write("Onde você quer adicionar?")
+    tipo = st.radio("Tipo de Material", ["FRACIONAMENTO (Com Lote)", "GENÉRICO (Sem Lote)"], horizontal=True)
+    
+    origem_selecionada = "FRACIONAMENTO" if "FRACIONAMENTO" in tipo else "SPEX/GENERICO"
+    
+    with st.form("form_add"):
+        c1, c2 = st.columns(2)
+        
+        # Lote só aparece se for Fracionamento
+        if origem_selecionada == "FRACIONAMENTO":
+            lote = c1.text_input("Lote *")
+        else:
+            lote = ""
+            c1.info("Genéricos não possuem lote.")
+            
+        endereco = c2.text_input("Endereço *", placeholder="Ex: A-10")
+        descricao = st.text_input("Descrição / Produto *", placeholder="Ex: DIPIRONA...")
+        
+        if st.form_submit_button("✅ Adicionar ao Estoque", type="primary", use_container_width=True):
+            if not descricao or not endereco:
+                st.warning("Preencha Descrição e Endereço!")
+            elif origem_selecionada == "FRACIONAMENTO" and not lote:
+                st.warning("Preencha o Lote!")
+            else:
+                with st.spinner("Adicionando..."):
+                    if adicionar_item(origem_selecionada, lote, descricao, endereco):
+                        st.toast("✅ Item criado!")
+                        st.cache_data.clear()
+                        time.sleep(1)
+                        st.rerun()
+
+# --- 7. INTERFACE PRINCIPAL ---
 def main():
-    c1, c2 = st.columns([5,1])
+    # Cabeçalho com Botões
+    c1, c2, c3 = st.columns([6, 1, 1])
     with c1:
         st.title("📦 Localizador de Estoque")
-        st.caption("Pesquisa e Edição Direta no Google Sheets")
     with c2:
-        if st.button("🔄 Atualizar"):
+        st.write("") 
+        if st.button("➕ Novo", type="primary", use_container_width=True):
+            dialog_adicionar()
+    with c3:
+        st.write("") 
+        if st.button("🔄 Atualizar", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
     df_total = load_data()
     
-    # Status
     if df_total.empty:
-        st.error("❌ Erro ao carregar dados ou planilha vazia.")
+        st.error("❌ Erro ao carregar dados. Verifique a conexão.")
     else:
-        st.success(f"📚 {len(df_total)} itens carregados do Google Sheets.")
+        st.caption(f"📚 {len(df_total)} itens carregados.")
 
     # Campo de Busca
     search_query = st.text_input("Buscar", placeholder="Digite Nome, Lote ou Endereço...")
@@ -183,10 +247,9 @@ def main():
                         """, unsafe_allow_html=True)
                     
                     with col_btn:
-                        # Botão de editar ao lado do card
-                        st.write("") # Espaço para alinhar
+                        st.write("") 
                         st.write("")
-                        if st.button("✏️", key=f"btn_{i}", help="Editar este item"):
+                        if st.button("✏️", key=f"btn_{i}", help="Editar"):
                             dialog_editar(item)
 
 if __name__ == "__main__":
