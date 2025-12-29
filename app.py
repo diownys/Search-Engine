@@ -1,12 +1,14 @@
 import streamlit as st
 import pandas as pd
-import requests
 
-st.set_page_config(page_title="Busca PharmUp (Via Supabase)", page_icon="💊", layout="wide")
+st.set_page_config(page_title="Localizador de Estoque", page_icon="📦", layout="wide")
 
 # --- 1. CARREGAMENTO DOS DADOS (GOOGLE SHEETS) ---
 @st.cache_data(ttl=60)
 def load_data():
+    """
+    Carrega as planilhas e padroniza as colunas pela posição.
+    """
     try:
         url_lotes = st.secrets["url_lotes"]
         url_produtos = st.secrets["url_produtos"]
@@ -17,139 +19,125 @@ def load_data():
     df_lotes = pd.DataFrame()
     df_produtos = pd.DataFrame()
 
+    # --- Tabela 1: LOTES (3 Colunas: Lote, Descrição, Endereço) ---
     try:
         df_lotes = pd.read_csv(url_lotes)
-        if len(df_lotes.columns) >= 2:
-            df_lotes = df_lotes.iloc[:, :2]
-            df_lotes.columns = ['lote_ref', 'endereco_ref']
-            df_lotes['lote_ref'] = df_lotes['lote_ref'].astype(str).str.strip().str.upper()
-    except Exception: pass
+        # Verifica se tem pelo menos 3 colunas
+        if len(df_lotes.columns) >= 3:
+            # Pega as 3 primeiras, não importa o nome
+            df_lotes = df_lotes.iloc[:, :3]
+            df_lotes.columns = ['lote', 'descricao', 'endereco']
+            
+            # Limpeza
+            df_lotes['lote'] = df_lotes['lote'].astype(str).str.strip().str.upper()
+            df_lotes['descricao'] = df_lotes['descricao'].astype(str).str.strip().str.upper()
+            df_lotes['endereco'] = df_lotes['endereco'].astype(str).str.strip()
+    except Exception as e:
+        st.warning(f"Erro ao ler Lotes: {e}")
 
+    # --- Tabela 2: PRODUTOS (2 Colunas: Descrição, Endereço) ---
     try:
         df_produtos = pd.read_csv(url_produtos)
+        # Verifica se tem pelo menos 2 colunas
         if len(df_produtos.columns) >= 2:
             df_produtos = df_produtos.iloc[:, :2]
-            df_produtos.columns = ['produto_ref', 'endereco_ref']
-            df_produtos['produto_ref'] = df_produtos['produto_ref'].astype(str).str.strip().str.upper()
-    except Exception: pass
+            df_produtos.columns = ['descricao', 'endereco']
+            
+            # Limpeza
+            df_produtos['descricao'] = df_produtos['descricao'].astype(str).str.strip().str.upper()
+            df_produtos['endereco'] = df_produtos['endereco'].astype(str).str.strip()
+    except Exception as e:
+        st.warning(f"Erro ao ler Produtos: {e}")
 
     return df_lotes, df_produtos
 
-# --- 2. CONEXÃO COM A EDGE FUNCTION (IGUAL AO HTML) ---
-def search_via_supabase(termo_busca):
-    """
-    Usa a Edge Function do Supabase para consultar o PharmUp.
-    Isso evita o erro 401 pois a autenticação é feita pelo servidor.
-    """
-    try:
-        config = st.secrets["supabase"]
-        url = config["function_url"]
-        key = config["anon_key"]
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}" # Usa a Anon Key do HTML
-        }
-        
-        # O script HTML enviava { loteCompleto: ... }
-        # Vamos tentar enviar o termo pesquisado nesse campo
-        body = { "loteCompleto": termo_busca }
-        
-        response = requests.post(url, json=body, headers=headers, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            # SE A FUNÇÃO RETORNAR UM OBJETO ÚNICO (Como parece ser no HTML)
-            # Nós transformamos ele em uma lista para o Streamlit exibir
-            if "cod_material" in data:
-                return [{
-                    "produtoDescricao": data.get("material_descricao", "Produto Encontrado"),
-                    "descricao": termo_busca, # O lote pesquisado
-                    "quantidadeAtual": data.get("saldo_unidades", 0),
-                    "dataValidade": data.get("data_validade", ""),
-                    "unidadeMedidaSigla": "UN" # A função do HTML retorna saldo em unidades
-                }], 200, "OK"
-            
-            # SE A FUNÇÃO RETORNAR ERRO
-            if "error" in data:
-                return [], 404, data["error"]
-                
-            return [], 200, "Formato desconhecido"
-            
-        else:
-            return [], response.status_code, response.text
+# --- 2. LÓGICA DE PESQUISA INTERNA ---
+def search_local(query, df_lotes, df_produtos):
+    query = query.upper().strip()
+    results = []
 
-    except Exception as e:
-        return [], 0, str(e)
+    # A) Busca na Tabela de LOTES
+    if not df_lotes.empty:
+        # Procura no LOTE OU na DESCRIÇÃO
+        mask = (
+            df_lotes['lote'].str.contains(query, na=False) | 
+            df_lotes['descricao'].str.contains(query, na=False)
+        )
+        matches = df_lotes[mask]
+        
+        for _, row in matches.iterrows():
+            results.append({
+                "origem": "Lotes (Estoque Detalhado)",
+                "nome": row['descricao'],
+                "lote": row['lote'],
+                "endereco": row['endereco'],
+                "cor": "#d1e7dd" # Verde
+            })
 
-# --- 3. TELA PRINCIPAL ---
+    # B) Busca na Tabela de PRODUTOS (Backup)
+    # Só busca aqui se não achou nada em lotes OU se quiser mostrar tudo misturado
+    if not df_produtos.empty:
+        mask = df_produtos['descricao'].str.contains(query, na=False)
+        matches = df_produtos[mask]
+        
+        for _, row in matches.iterrows():
+            results.append({
+                "origem": "Produtos (Genérico)",
+                "nome": row['descricao'],
+                "lote": "N/A", # Essa tabela não tem lote
+                "endereco": row['endereco'],
+                "cor": "#fff3cd" # Amarelo
+            })
+
+    return results
+
+# --- 3. INTERFACE ---
 def main():
-    st.title("💊 Localizador (Modo Supabase)")
-    st.info("ℹ️ Este modo usa o Proxy do seu script antigo. Ele é otimizado para busca por **LOTE COMPLETO**.")
-    
+    st.title("📦 Localizador de Estoque (Offline)")
+    st.caption("Pesquisa direta nas planilhas do Google Drive")
+
     df_lotes, df_produtos = load_data()
+
+    # Indicadores de Status
     c1, c2 = st.columns(2)
-    if df_lotes.empty: c1.warning("⚠️ Lotes Offline")
-    if df_produtos.empty: c2.warning("⚠️ Produtos Offline")
+    if not df_lotes.empty:
+        c1.success(f"📚 Tabela Lotes: {len(df_lotes)} linhas")
+    else:
+        c1.error("❌ Tabela Lotes Vazia")
+        
+    if not df_produtos.empty:
+        c2.success(f"📋 Tabela Produtos: {len(df_produtos)} linhas")
+    else:
+        c2.error("❌ Tabela Produtos Vazia")
 
-    search_query = st.text_input("Pesquisar Lote", placeholder="Ex: DV25112111500203")
+    # Campo de Busca
+    search_query = st.text_input("Buscar", placeholder="Digite Nome, Lote ou Código...")
 
-    if st.button("Buscar") or search_query:
-        with st.spinner("Consultando via Proxy Supabase..."):
-            api_data, status, raw_text = search_via_supabase(search_query)
-
-        if not api_data:
-            if status == 404 or "não encontrado" in str(raw_text).lower():
-                st.warning("Lote não encontrado no PharmUp.")
-            else:
-                st.error(f"Erro na conexão: {status}")
-                st.code(raw_text)
+    if search_query:
+        if len(search_query) < 2:
+            st.warning("Digite pelo menos 2 letras.")
         else:
-            st.success(f"Lote Localizado!")
+            resultados = search_local(search_query, df_lotes, df_produtos)
             
-            for item in api_data:
-                nome = str(item.get('produtoDescricao', 'Unknown')).strip()
-                lote = str(item.get('descricao', search_query)).strip() # Usa o termo buscado se não vier lote
-                saldo = item.get('quantidadeAtual', 0)
-                validade = str(item.get('dataValidade', ''))[:10]
-
-                locais = []
-                origem = ""
-                cor = "#f0f2f6"
-
-                # 1. Busca Endereço
-                if not df_lotes.empty:
-                    match = df_lotes[df_lotes['lote_ref'] == lote.upper()]
-                    if not match.empty:
-                        locais = match['endereco_ref'].unique()
-                        origem = "Planilha Lotes"
-                        cor = "#d1e7dd"
-
-                if not locais and not df_produtos.empty:
-                    # Tenta achar o nome na planilha de produtos
-                    match = df_produtos[df_produtos['produto_ref'].str.contains(nome.upper(), na=False)]
-                    if not match.empty:
-                        locais = match['endereco_ref'].unique()
-                        origem = "Planilha Produtos"
-                        cor = "#fff3cd"
-
-                end_str = " | ".join(map(str, locais)) if len(locais) > 0 else "Endereço Não Localizado"
+            if not resultados:
+                st.info("Nenhum item encontrado nas planilhas.")
+            else:
+                st.write(f"**Encontrados {len(resultados)} registros:**")
                 
-                st.markdown(f"""
-                <div style="background-color: {cor}; padding:15px; border-radius:10px; margin-bottom:10px; border:1px solid #ccc; color:black;">
-                    <h4 style="margin:0; color:#black">{nome}</h4>
-                    <div style="display:flex; gap: 20px; margin-top:5px; color:#333;">
-                        <span>📦 Lote: <b>{lote}</b></span>
-                        <span>📊 Saldo: <b>{saldo}</b></span>
-                        <span>📅 Val: {validade}</span>
+                for item in resultados:
+                    st.markdown(f"""
+                    <div style="background-color: {item['cor']}; padding:15px; border-radius:8px; margin-bottom:10px; border:1px solid #ccc; color:black;">
+                        <h4 style="margin:0; color:#333;">{item['nome']}</h4>
+                        <div style="display:flex; justify-content:space-between; margin-top:5px; font-size:0.9em; color:#555;">
+                            <span>📦 Lote: <b>{item['lote']}</b></span>
+                            <span>📂 Fonte: {item['origem']}</span>
+                        </div>
+                        <hr style="margin:8px 0; border-color:rgba(0,0,0,0.1);">
+                        <div style="font-size:1.2em; font-weight:bold; color:#000;">
+                            📍 {item['endereco']}
+                        </div>
                     </div>
-                    <hr style="margin:10px 0; border-color:#bbb;">
-                    <div style="font-size:1.1em; font-weight:bold; color:black;">
-                        📍 {end_str} <small>({origem})</small>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
