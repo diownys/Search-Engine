@@ -4,83 +4,116 @@ from streamlit_gsheets import GSheetsConnection
 import time
 
 # --- CONFIGURAÇÃO VISUAL ---
-st.set_page_config(page_title="Controle de Estoque", page_icon="📗", layout="wide")
+st.set_page_config(page_title="Localizador de Estoque", page_icon="📦", layout="wide")
 
+# CSS para replicar o estilo dos cards e botões
 st.markdown("""
 <style>
     .stButton button { border-radius: 8px; font-weight: 600; }
     div[data-testid="stMetricValue"] { font-size: 1.1rem; }
+    /* Estilo para os Cards de Resultado */
+    .stock-card {
+        padding: 15px; 
+        border-radius: 8px; 
+        margin-bottom: 10px; 
+        border: 1px solid #ccc; 
+        color: black;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. CONEXÃO (AUTOMÁTICA PELOS SECRETS) ---
+# --- 1. CONEXÃO GOOGLE SHEETS ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- 2. FUNÇÕES DE DADOS ---
-def carregar_dados():
+# --- 2. CARREGAMENTO DOS DADOS ---
+@st.cache_data(ttl=10) # Cache curto para atualizar rápido após edição
+def load_data():
     try:
-        # Lê a aba LOTES (Assumindo colunas: Lote, Descrição, Endereço)
-        # ttl=0 garante que não pegue cache velho
+        # Lê aba LOTES (Fracionamento)
         df_lotes = conn.read(worksheet="Lotes", usecols=[0, 1, 2], ttl=0)
-        df_lotes.columns = ['Lote', 'Descricao', 'Endereco'] 
+        df_lotes.columns = ['Lote', 'Descricao', 'Endereco']
         df_lotes['Origem'] = 'FRACIONAMENTO'
-        df_lotes['ID_Linha'] = df_lotes.index # Guarda a linha original para salvar depois
+        df_lotes['ID_Linha'] = df_lotes.index
 
-        # Lê a aba PRODUTOS (Assumindo colunas: Descrição, Endereço)
+        # Lê aba PRODUTOS (Genérico)
         df_produtos = conn.read(worksheet="Produtos", usecols=[0, 1], ttl=0)
         df_produtos.columns = ['Descricao', 'Endereco']
-        df_produtos['Lote'] = '' # Produtos genéricos não têm lote
+        df_produtos['Lote'] = '' # Vazio para produtos sem lote
         df_produtos['Origem'] = 'SPEX/GENERICO'
         df_produtos['ID_Linha'] = df_produtos.index
 
-        # Junta tudo numa tabela só para o App
+        # Unifica
         df_total = pd.concat([df_lotes, df_produtos], ignore_index=True)
-        df_total = df_total.fillna("") # Limpa campos vazios
+        df_total = df_total.fillna("") 
+        
+        # Limpeza para padronizar busca
+        df_total['Descricao'] = df_total['Descricao'].astype(str).str.strip().str.upper()
+        df_total['Lote'] = df_total['Lote'].astype(str).str.strip().str.upper()
+        df_total['Endereco'] = df_total['Endereco'].astype(str).str.strip().str.upper()
+        
         return df_total
-
     except Exception as e:
-        st.error(f"Erro ao carregar planilhas: {e}")
+        st.error(f"Erro ao carregar dados: {e}")
         return pd.DataFrame()
 
+# --- 3. FUNÇÃO DE BUSCA LOCAL ---
+def search_local(query, df):
+    query = query.upper().strip()
+    if query == "": return []
+    
+    # Filtra no DataFrame
+    mask = (
+        df['Descricao'].str.contains(query, na=False) | 
+        df['Lote'].str.contains(query, na=False) |
+        df['Endereco'].str.contains(query, na=False)
+    )
+    matches = df[mask]
+    
+    results = []
+    for _, row in matches.iterrows():
+        # Define cor baseada na origem (igual ao seu exemplo)
+        cor = "#d1e7dd" if row['Origem'] == 'FRACIONAMENTO' else "#fff3cd"
+        
+        results.append({
+            "nome": row['Descricao'],
+            "lote": row['Lote'] if row['Lote'] else "N/A",
+            "endereco": row['Endereco'],
+            "origem": row['Origem'],
+            "cor": cor,
+            "raw_data": row # Guarda dados originais para edição
+        })
+    return results
+
+# --- 4. FUNÇÃO DE SALVAR NO SHEETS ---
 def salvar_no_sheets(item, novo_lote, nova_desc, novo_end):
-    """Salva a edição na aba correta do Google Sheets"""
     try:
-        # Define em qual aba vamos salvar
         nome_aba = "Lotes" if item['Origem'] == "FRACIONAMENTO" else "Produtos"
-        
-        # 1. Baixa a planilha atual (para não sobrescrever dados de outros usuários)
         df_atual = conn.read(worksheet=nome_aba, ttl=0)
-        
-        # 2. Pega o índice da linha original
         idx = int(item['ID_Linha'])
         
-        # 3. Atualiza as células certas
         if nome_aba == "Lotes":
-            # Lotes: Coluna A(0)=Lote, B(1)=Descrição, C(2)=Endereço
             df_atual.iat[idx, 0] = novo_lote
             df_atual.iat[idx, 1] = nova_desc
             df_atual.iat[idx, 2] = novo_end
         else:
-            # Produtos: Coluna A(0)=Descrição, B(1)=Endereço
             df_atual.iat[idx, 0] = nova_desc
             df_atual.iat[idx, 1] = novo_end
             
-        # 4. Envia de volta para o Google
         conn.update(worksheet=nome_aba, data=df_atual)
         return True
     except Exception as e:
         st.error(f"Erro ao salvar: {e}")
         return False
 
-# --- 3. MODAL DE EDIÇÃO ---
+# --- 5. MODAL DE EDIÇÃO ---
 @st.dialog("✏️ Editar Item")
-def dialog_editar(item):
-    st.caption(f"Editando item da aba: **{item['Origem']}**")
+def dialog_editar(item_dict):
+    item = item_dict['raw_data'] # Recupera o objeto row original
+    st.caption(f"Editando: {item['Descricao']}")
     
     with st.form("form_edit"):
         c1, c2 = st.columns(2)
         
-        # Se for Fracionamento, libera edição de Lote. Se for Genérico, trava.
         if item['Origem'] == 'FRACIONAMENTO':
             val_lote = c1.text_input("Lote", value=item['Lote'])
         else:
@@ -89,73 +122,72 @@ def dialog_editar(item):
         val_end = c2.text_input("Endereço", value=item['Endereco'])
         val_desc = st.text_input("Descrição / Produto", value=item['Descricao'])
         
-        if st.form_submit_button("💾 Salvar no Google Sheets", type="primary", use_container_width=True):
-            with st.spinner("Enviando para o Google..."):
+        if st.form_submit_button("💾 Salvar Alterações", type="primary", use_container_width=True):
+            with st.spinner("Salvando..."):
                 if salvar_no_sheets(item, val_lote, val_desc, val_end):
                     st.toast("✅ Salvo com sucesso!")
-                    st.cache_data.clear() # Limpa cache do app
+                    st.cache_data.clear()
                     time.sleep(1)
-                    st.rerun() # Recarrega a página
+                    st.rerun()
 
-# --- 4. TELA PRINCIPAL ---
+# --- 6. INTERFACE PRINCIPAL ---
 def main():
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        st.title("📦 Estoque Integrado (Google Sheets)")
-    with col2:
-        if st.button("🔄 Atualizar", use_container_width=True):
+    c1, c2 = st.columns([5,1])
+    with c1:
+        st.title("📦 Localizador de Estoque")
+        st.caption("Pesquisa e Edição Direta no Google Sheets")
+    with c2:
+        if st.button("🔄 Atualizar"):
             st.cache_data.clear()
             st.rerun()
 
-    # Carrega dados
-    df = carregar_dados()
+    df_total = load_data()
     
-    if df.empty:
-        st.info("Conectando ao Google Sheets... (Se demorar, verifique se compartilhou a planilha com o robô)")
-        return
+    # Status
+    if df_total.empty:
+        st.error("❌ Erro ao carregar dados ou planilha vazia.")
+    else:
+        st.success(f"📚 {len(df_total)} itens carregados do Google Sheets.")
 
-    # Barra de Pesquisa
-    busca = st.text_input("🔎 Pesquisar", placeholder="Digite nome, lote ou endereço...", label_visibility="collapsed")
-    
-    # Filtro local
-    df_show = df.copy()
-    if busca:
-        termo = busca.upper()
-        mask = (
-            df_show['Descricao'].str.upper().str.contains(termo, na=False) |
-            df_show['Lote'].str.upper().str.contains(termo, na=False) |
-            df_show['Endereco'].str.upper().str.contains(termo, na=False)
-        )
-        df_show = df_show[mask]
+    # Campo de Busca
+    search_query = st.text_input("Buscar", placeholder="Digite Nome, Lote ou Endereço...")
 
-    st.caption(f"Encontrados: **{len(df_show)}** registros")
-
-    # Tabela Interativa
-    event = st.dataframe(
-        df_show,
-        column_config={
-            "Lote": st.column_config.TextColumn("📦 Lote", width="medium"),
-            "Descricao": st.column_config.TextColumn("📝 Descrição", width="large"),
-            "Endereco": st.column_config.TextColumn("📍 Endereço", width="small"),
-            "Origem": st.column_config.Column("🏷️ Aba", width="small"),
-            "ID_Linha": None # Oculto
-        },
-        use_container_width=True,
-        hide_index=True,
-        selection_mode="single-row", # Permite selecionar 1 linha
-        on_select="rerun",
-        height=500
-    )
-
-    # Ação ao Selecionar
-    if len(event.selection["rows"]) > 0:
-        idx = event.selection["rows"][0]
-        item_selecionado = df_show.iloc[idx]
-        
-        st.info(f"Selecionado: **{item_selecionado['Descricao']}**")
-        
-        if st.button("✏️ Editar Item Selecionado", type="primary", use_container_width=True):
-            dialog_editar(item_selecionado)
+    if search_query:
+        if len(search_query) < 2:
+            st.warning("Digite pelo menos 2 letras.")
+        else:
+            resultados = search_local(search_query, df_total)
+            
+            if not resultados:
+                st.info("Nenhum item encontrado.")
+            else:
+                st.write(f"**Encontrados {len(resultados)} registros:**")
+                
+                # Renderiza os Cards
+                for i, item in enumerate(resultados):
+                    col_card, col_btn = st.columns([5, 1])
+                    
+                    with col_card:
+                        st.markdown(f"""
+                        <div class="stock-card" style="background-color: {item['cor']};">
+                            <h4 style="margin:0; color:#333;">{item['nome']}</h4>
+                            <div style="display:flex; justify-content:space-between; margin-top:5px; font-size:0.9em; color:#555;">
+                                <span>📦 Lote: <b>{item['lote']}</b></span>
+                                <span>📂 Fonte: {item['origem']}</span>
+                            </div>
+                            <hr style="margin:8px 0; border-color:rgba(0,0,0,0.1);">
+                            <div style="font-size:1.2em; font-weight:bold; color:#000;">
+                                📍 {item['endereco']}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    with col_btn:
+                        # Botão de editar ao lado do card
+                        st.write("") # Espaço para alinhar
+                        st.write("")
+                        if st.button("✏️", key=f"btn_{i}", help="Editar este item"):
+                            dialog_editar(item)
 
 if __name__ == "__main__":
     main()
