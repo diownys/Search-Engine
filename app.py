@@ -11,7 +11,7 @@ def load_data():
         url_lotes = st.secrets["url_lotes"]
         url_produtos = st.secrets["url_produtos"]
     except:
-        st.error("❌ ERRO CRÍTICO: Secrets não configurados.")
+        st.error("❌ Secrets não configurados.")
         return pd.DataFrame(), pd.DataFrame()
 
     df_lotes = pd.DataFrame()
@@ -21,40 +21,83 @@ def load_data():
     try:
         df_lotes = pd.read_csv(url_lotes)
         if len(df_lotes.columns) >= 2:
-            # Pega 1ª e 2ª coluna independente do nome
-            df_lotes = df_lotes.iloc[:, :2] 
+            df_lotes = df_lotes.iloc[:, :2] # Pega col 1 e 2
             df_lotes.columns = ['lote_ref', 'endereco_ref']
             df_lotes['lote_ref'] = df_lotes['lote_ref'].astype(str).str.strip().str.upper()
     except Exception as e:
-        st.warning(f"⚠️ Aviso na Tabela Lotes: {e}")
+        pass # Silencia erro visual se falhar
 
     # Tabela 2: Produtos
     try:
         df_produtos = pd.read_csv(url_produtos)
         if len(df_produtos.columns) >= 2:
-            # Pega 1ª e 2ª coluna independente do nome ("Produtos", "Descricao", etc)
-            df_produtos = df_produtos.iloc[:, :2]
+            df_produtos = df_produtos.iloc[:, :2] # Pega col 1 e 2
             df_produtos.columns = ['produto_ref', 'endereco_ref']
             df_produtos['produto_ref'] = df_produtos['produto_ref'].astype(str).str.strip().str.upper()
     except Exception as e:
-        st.warning(f"⚠️ Aviso na Tabela Produtos: {e}")
+        pass
 
     return df_lotes, df_produtos
 
-# --- 2. CONEXÃO COM PHARMUP ---
-def search_pharmup_api(search_term):
-    # Carrega configurações
+# --- 2. AUTENTICAÇÃO AUTOMÁTICA (LOGIN) ---
+@st.cache_data(ttl=3600) # Cache do Token por 1 hora
+def get_auth_token():
+    """
+    Faz login no PharmUp e retorna o Token Bearer.
+    """
     try:
         config = st.secrets["pharmup"]
-        api_url = config["url"].strip('"') # Remove aspas extras se houver
+        login_url = config["login_url"]
+        
+        # Envia login e senha como parâmetros na URL (Query String)
+        params = {
+            "login": config["username"],
+            "senha": config["password"]
+        }
+        
         headers = {
-            "User-Agent": config["user_agent"].strip('"'),
-            "Referer": config["referer"].strip('"'),
-            "Origin": config["origin"].strip('"'),
-            "Host": config["host"].strip('"')
+             "User-Agent": config["user_agent"]
+        }
+
+        # Faz o POST para pegar o token
+        response = requests.post(login_url, params=params, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            # O token vem direto no corpo da resposta ou dentro de um JSON
+            try:
+                # Tenta ler como JSON
+                return response.json() 
+            except:
+                # Se não for JSON, pega o texto puro (o token bruto)
+                return response.text.strip('"')
+        else:
+            st.error(f"Falha no Login: {response.status_code}")
+            return None
+    except Exception as e:
+        st.error(f"Erro ao tentar logar: {e}")
+        return None
+
+# --- 3. CONEXÃO COM A BUSCA ---
+def search_pharmup_api(search_term):
+    # 1. Obtém o Token (faz login se precisar)
+    token = get_auth_token()
+    
+    if not token:
+        return [], 401, "Falha ao obter Token de Login"
+
+    try:
+        config = st.secrets["pharmup"]
+        api_url = f"{config['base_url']}/ProdutoLote/ListProdutoLote"
+        
+        headers = {
+            "Authorization": f"Bearer {token}", # Usa o token gerado
+            "User-Agent": config["user_agent"],
+            "Referer": config["referer"],
+            "Origin": config["origin"],
+            "Host": "pharmup-industria-api.azurewebsites.net"
         }
     except:
-        return [], 0, "Erro: Verifique o arquivo secrets.toml (seção [pharmup])"
+        return [], 0, "Erro Config Secrets"
 
     params = {
         "filterKey": search_term,
@@ -74,85 +117,76 @@ def search_pharmup_api(search_term):
     except Exception as e:
         return [], 0, str(e)
 
-# --- 3. TELA PRINCIPAL ---
+# --- 4. TELA PRINCIPAL ---
 def main():
-    st.title("💊 Localizador PharmUp (Modo Diagnóstico)")
+    st.title("💊 Localizador PharmUp")
     
-    # Status das Tabelas
     df_lotes, df_produtos = load_data()
-    c1, c2 = st.columns(2)
-    if not df_lotes.empty:
-        c1.success(f"✅ Tabela Lotes: {len(df_lotes)} linhas")
-    else:
-        c1.error("❌ Tabela Lotes Vazia")
-        
-    if not df_produtos.empty:
-        c2.success(f"✅ Tabela Produtos: {len(df_produtos)} linhas")
-    else:
-        c2.error("❌ Tabela Produtos Vazia")
 
-    # Busca
-    search_query = st.text_input("Pesquisar Produto ou Lote", placeholder="Ex: CICLOSPORINA")
+    # Barra de Status Discreta
+    status_col1, status_col2 = st.columns(2)
+    if df_lotes.empty:
+        status_col1.warning("⚠️ Lotes Offline")
+    if df_produtos.empty:
+        status_col2.warning("⚠️ Produtos Offline")
+
+    search_query = st.text_input("Pesquisar", placeholder="Digite Nome ou Lote...")
 
     if st.button("Buscar") or search_query:
-        st.divider()
-        with st.spinner("Conectando ao PharmUp..."):
+        with st.spinner("Autenticando e Buscando..."):
             api_data, status, raw_text = search_pharmup_api(search_query)
 
-        # --- DIAGNÓSTICO DO ERRO ---
         if not api_data:
-            st.error("🚫 Nenhum resultado retornado pela API.")
-            
-            with st.expander("🕵️‍♂️ CLIQUE AQUI PARA VER O MOTIVO", expanded=True):
-                st.write(f"**Status Code:** {status}")
-                
-                if status == 200:
-                    st.warning("O site respondeu OK, mas não achou o produto. Tente pesquisar 'CICLOSPORINA' (igual ao log que você mandou).")
-                    st.code(raw_text) # Mostra o JSON vazio
-                elif status == 403 or status == 500:
-                    st.error("BLOQUEIO: O PharmUp recusou a conexão. Verifique os Secrets.")
-                elif status == 0:
-                    st.error(f"ERRO DE CÓDIGO: {raw_text}")
-        
-        # --- SUCESSO ---
+            if status == 200:
+                st.info("Nenhum registro encontrado para essa busca.")
+            else:
+                st.error(f"Erro na API: {status}")
+                with st.expander("Detalhes Técnicos"):
+                    st.code(raw_text)
         else:
-            st.success(f"Encontrados {len(api_data)} itens!")
+            st.success(f"Encontrados {len(api_data)} itens")
             
             for item in api_data:
-                # Dados da API
                 nome = str(item.get('produtoDescricao', 'Unknown')).strip()
                 lote = str(item.get('descricao', 'Unknown')).strip()
                 saldo = item.get('quantidadeAtual', 0)
                 
-                # Cruzamento
+                # Lógica de Endereçamento
                 locais = []
-                origem = "N/A"
-                cor = "gray"
+                origem = ""
+                cor = "#eee" # Cinza padrão
 
-                # 1. Tenta Lote
+                # 1. Lote
                 if not df_lotes.empty:
                     match = df_lotes[df_lotes['lote_ref'] == lote.upper()]
                     if not match.empty:
                         locais = match['endereco_ref'].unique()
-                        origem = "Lote (Exato)"
-                        cor = "green"
+                        origem = "Lote"
+                        cor = "#d4edda" # Verde claro
 
-                # 2. Tenta Produto
+                # 2. Produto (apenas se não achou por lote)
                 if not locais and not df_produtos.empty:
+                    # Tenta match exato ou parcial
                     match = df_produtos[df_produtos['produto_ref'].str.contains(nome.upper(), na=False)]
                     if not match.empty:
                         locais = match['endereco_ref'].unique()
-                        origem = "Nome (Aproximado)"
-                        cor = "orange"
+                        origem = "Nome Aprox."
+                        cor = "#fff3cd" # Amarelo claro
 
                 end_str = ", ".join(map(str, locais)) if len(locais) > 0 else "Não Localizado"
                 
-                # Card Visual
+                # Layout do Card
                 st.markdown(f"""
-                <div style="border:1px solid #ddd; padding:10px; border-radius:8px; border-left: 5px solid {cor}; margin-bottom:10px">
-                    <h4 style="margin:0">{nome}</h4>
-                    <p style="margin:0">Lote: <b>{lote}</b> | Saldo: <b>{saldo}</b></p>
-                    <p style="margin:0; font-size:1.1em">📍 <b>{end_str}</b> <span style="font-size:0.8em; color:#666">({origem})</span></p>
+                <div style="background-color: {cor}; padding:15px; border-radius:10px; margin-bottom:10px; border:1px solid #ccc; color: black;">
+                    <h4 style="margin:0; color:black;">{nome}</h4>
+                    <div style="display:flex; justify-content:space-between; margin-top:5px;">
+                        <span>📦 Lote: <b>{lote}</b></span>
+                        <span>📊 Saldo: <b>{saldo}</b></span>
+                    </div>
+                    <hr style="margin:5px 0; border-color:#bbb;">
+                    <div style="font-size:1.1em;">
+                        📍 <b>{end_str}</b> <small>({origem})</small>
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
 
